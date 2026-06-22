@@ -16,6 +16,11 @@ public class SpeakerKitDiarizer: ModelManager, Diarizer, @unchecked Sendable {
     /// Performs diarization on the provided audio using the loaded models.
     public let diarize: ([Float], (any DiarizationOptions)?, (@Sendable (Progress) -> Void)?) async throws -> DiarizationResult
 
+    /// Additive (fork) API: diarize and also return one L2-normalized mean speaker
+    /// embedding (voiceprint) per final speaker id. Non-nil only for the default
+    /// Pyannote backend; nil for custom diarize closures.
+    public let diarizeWithEmbeddings: (([Float], (any DiarizationOptions)?) async throws -> (DiarizationResult, [Int: [Float]]))?
+
     /// - Parameters:
     ///   - loader: Backend-specific model loader.
     ///   - downloader: Downloader for model resolution.
@@ -29,10 +34,15 @@ public class SpeakerKitDiarizer: ModelManager, Diarizer, @unchecked Sendable {
     ) {
         if let diarize {
             self.diarize = diarize
+            self.diarizeWithEmbeddings = nil
         } else if let pyannoteLoader = loader as? PyannoteModelLoader {
             self.diarize = { audioArray, options, progressCallback in
                 let diarizer = try pyannoteLoader.makeDiarizer()
                 return try await diarizer.diarize(audioArray: audioArray, options: options, progressCallback: progressCallback)
+            }
+            self.diarizeWithEmbeddings = { audioArray, options in
+                let diarizer = try pyannoteLoader.makeDiarizer()
+                return try await diarizer.diarizeWithSpeakerEmbeddings(audioArray: audioArray, options: options)
             }
         } else {
             preconditionFailure("diarize closure must be provided for non-Pyannote loaders")

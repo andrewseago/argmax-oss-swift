@@ -70,6 +70,27 @@ open class SpeakerKit: @unchecked Sendable {
         return try await diarizer.diarize(audioArray: audioArray, options: options, progressCallback: progressCallback)
     }
 
+    /// Additive (fork) API for persistent speaker identification.
+    ///
+    /// Runs diarization and additionally returns one L2-normalized mean embedding
+    /// (voiceprint) per final speaker id. The keys match `SpeakerInfo.speakerId` in
+    /// the returned `DiarizationResult`, so a caller can map each diarized speaker to
+    /// a stable voiceprint for cross-file matching.
+    ///
+    /// Only available with the default Pyannote diarizer; throws otherwise.
+    open func diarizeWithEmbeddings(
+        audioArray: [Float],
+        options: (any DiarizationOptions)? = nil
+    ) async throws -> (diarization: DiarizationResult, embeddingsBySpeakerId: [Int: [Float]]) {
+        try await ensureModelsLoaded()
+        guard let speakerKitDiarizer = diarizer as? SpeakerKitDiarizer,
+              let run = speakerKitDiarizer.diarizeWithEmbeddings else {
+            throw SpeakerKitError.invalidConfiguration("Speaker embeddings are only available with the default Pyannote diarizer")
+        }
+        let (result, embeddings) = try await run(audioArray, options)
+        return (result, embeddings)
+    }
+
     /// Builds RTTM lines from a diarization result, optionally aligned to a transcription.
     /// - Parameters:
     ///   - diarizationResult: Result from `diarize(audioArray:options:)`.

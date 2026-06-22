@@ -77,6 +77,17 @@ public final class PyannoteDiarizer: Diarizer, @unchecked Sendable {
     ) async throws -> DiarizationResult {
         try await diarizerActor.diarize(audioArray: audioArray, options: options, progressCallback: progressCallback)
     }
+
+    /// Additive (fork) API: diarize and also return one L2-normalized mean speaker
+    /// embedding (voiceprint) per final speaker id, for cross-file speaker identification.
+    /// The dictionary keys are the same speaker ids used by `DiarizationResult`'s
+    /// `SpeakerInfo.speakerId`.
+    public func diarizeWithSpeakerEmbeddings(
+        audioArray: [Float],
+        options: (any DiarizationOptions)? = nil
+    ) async throws -> (DiarizationResult, [Int: [Float]]) {
+        try await diarizerActor.diarizeWithSpeakerEmbeddings(audioArray: audioArray, options: options)
+    }
 }
 
 // MARK: - PyannoteDiarizerActor
@@ -266,6 +277,68 @@ actor PyannoteDiarizerActor {
         progressObj.completedUnitCount = 100
         progressCallback?(progressObj)
         return diarizationResult
+    }
+
+    /// Additive (fork) variant of `diarize` that also returns one L2-normalized mean
+    /// embedding per final speaker id. Mirrors the no-progress path of `diarize` but
+    /// retains the per-window embeddings produced by clustering so they can be averaged
+    /// per speaker. Existing diarization paths are left untouched.
+    func diarizeWithSpeakerEmbeddings(
+        audioArray: [Float],
+        options: (any DiarizationOptions)? = nil
+    ) async throws -> (DiarizationResult, [Int: [Float]]) {
+        let opts = options as? PyannoteDiarizationOptions
+
+        try await initialize(audioArray: audioArray, options: opts, progressCallback: nil)
+
+        // Mirror clusterSpeakers (no-progress path) but keep the clustering embeddings.
+        try await diarizationTask?.value
+        diarizationTask = nil
+
+        let resolvedOptions = opts ?? PyannoteDiarizationOptions()
+        let clusteringConfig = config.clusterer.clusteringConfig(from: resolvedOptions)
+        let clusteringResult = await config.clusterer.update(config: clusteringConfig)
+
+        var result = postProcess(
+            speakerEmbeddings: clusteringResult.speakerEmbeddings,
+            originalLength: audioLength,
+            useExclusiveReconciliation: resolvedOptions.useExclusiveReconciliation
+        )
+        if let minActiveOffset = opts?.minActiveOffset {
+            result.updateSegments(minActiveOffset: minActiveOffset)
+        }
+
+        // Mean embedding per final speaker id (clusterId == speakerId, see postProcess).
+        var sums: [Int: [Float]] = [:]
+        var counts: [Int: Int] = [:]
+        for embedding in clusteringResult.speakerEmbeddings {
+            let id = embedding.clusterId
+            guard id >= 0 else { continue }
+            let vec = embedding.embedding
+            guard !vec.isEmpty else { continue }
+            if var acc = sums[id] {
+                let n = min(acc.count, vec.count)
+                for i in 0..<n { acc[i] += vec[i] }
+                sums[id] = acc
+                counts[id, default: 0] += 1
+            } else {
+                sums[id] = vec
+                counts[id] = 1
+            }
+        }
+
+        var means: [Int: [Float]] = [:]
+        for (id, sum) in sums {
+            let denom = Float(max(counts[id] ?? 1, 1))
+            var mean = sum.map { $0 / denom }
+            var norm: Float = 0
+            for value in mean { norm += value * value }
+            norm = norm.squareRoot()
+            if norm > 0 { mean = mean.map { $0 / norm } }
+            means[id] = mean
+        }
+
+        return (result, means)
     }
 
     private func postProcess(speakerEmbeddings: [SpeakerEmbedding], originalLength: Int, useExclusiveReconciliation: Bool) -> DiarizationResult {
